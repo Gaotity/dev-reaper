@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Stop leftover developer processes that hold memory and file watchers; report the rest.
+
+Runs from a LaunchAgent every 30 minutes. Idleness is measured from cumulative CPU time over a
+short sampling window, never from the decaying %CPU column. Only the current user's processes
+are considered.
+
+Stopped automatically (SIGTERM, then SIGKILL after a grace period):
+  - Nx daemons whose workspace is gone, or whose log shows no open client connection and no
+    handled request for --daemon-idle-minutes. A connected client (Nx Console, `nx watch`) or a
+    missing or unreadable log keeps the daemon alive.
+  - Reparented helpers (PPID 1, idle, older than --orphan-hours): MCP servers, tsserver,
+    Biome LSP proxies, Nx plugin workers.
+  - Playwright CLI daemons and Playwright browsers (PPID 1 by design), idle and older than
+    --daemon-hours.
+  - Wedged dev servers: PPID 1, older than 2 hours, above 70% CPU now and above 50% averaged
+    over their whole lifetime (a rebuild burst on a healthy server does not qualify).
+Reported only (one macOS notification per new set): idle reparented dev servers, idle
+cursor-agent processes older than --daemon-hours, and reparented `yarn install` runs, which are
+never killed because that leaves a half-written node_modules.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+HOME = Path.home()
+LOG = HOME / "Library/Logs/dev-reaper.log"
+STATE = HOME / "Library/Caches/dev-reaper/notified.json"
+
+NX_DAEMON = re.compile(r"(\S+)/node_modules/\S*nx/dist/src/daemon/server/start\.js")
+NX_LINE = re.compile(r"^\[NX [^\]]*Daemon Server\] - (\S+Z) - (.*)")
+NX_HANDLED = re.compile(r"Handled \S+ message ")
+NX_CONNECTIONS = re.compile(r"Number of open connections: (\d+)")
+LOG_TAIL_BYTES = 1 << 20
+INTERPRETERS = {"node", "python", "python3", "uv", "uvx", "npx", "npm", "bun", "deno"}
+MCP_SEGMENT = re.compile(r"(^|[-@_.])mcp([-@_.]|$)", re.I)
+
+
+PACKAGE_DIRS = ("/_npx/", "/node_modules/.bin/", "/uv/tools/", "/.local/bin/")
+
+
+def is_mcp(command: str) -> bool:
+    """A stdio MCP server: an *mcp* binary, or an interpreter running an installed *mcp* package.
+
+    App flags (WebMCP), the user's own scripts under an mcp-named folder, and HTTP servers
+    (--port), which are PPID 1 by design, do not count.
+    """
+    words = command.split()
+    if "--port" in words or any(word.startswith("--port=") for word in words):
+        return False
+    head = words[0].rsplit("/", 1)[-1].lower()
+    if MCP_SEGMENT.search(head):
+        return True
+    if head not in INTERPRETERS:
+        return False
+    for word in words[1:]:
+        if word.startswith("-") or "=" in word:
+            continue
+        if not any(directory in word for directory in PACKAGE_DIRS):
+            continue
+        if MCP_SEGMENT.search(word.rsplit("/node_modules/", 1)[-1].split("/")[0]) or any(
+            MCP_SEGMENT.search(segment) for segment in word.split("/")[-2:]
+        ):
+            return True
+    return False
+
+
+REPARENTED = [
+    ("mcp server", is_mcp),
+    ("tsserver", re.compile(r"tsserver(\.js)?\b")),
+    ("biome lsp", re.compile(r"/biome lsp-proxy\b")),
+    ("nx plugin worker", re.compile(r"/nx/(dist/)?src/project-graph/plugins/isolation/plugin-worker")),
+]
+PLAYWRIGHT = [
+    ("playwright daemon", re.compile(r"playwright-core/lib/entry/cliDaemon\.js")),
+    ("playwright browser", re.compile(r"/ms-playwright/")),
+]
+DEV_SERVER = re.compile(r"next-server|\bnext dev\b|/vite(\.js)? |\bnx(\.js)? run \S+:(dev|serve)\b")
+CURSOR_AGENT = re.compile(r"/cursor-agent ")
+YARN_INSTALL = re.compile(r"/yarn install\b|\byarn(\.js)? install\b")
+
+
+def seconds(text: str) -> float:
+    """Parse ps etime/time: [[dd-]hh:]mm:ss[.cc]."""
+    days, _, rest = text.rpartition("-")
+    total = 0.0
+    for part in rest.split(":"):
+        total = total * 60 + float(part)
+    return total + (int(days) * 86400 if days else 0)
+
+
+def snapshot(fixture: str | None) -> dict[int, dict]:
+    if fixture:
+        text = Path(fixture).read_text()
+    else:
+        text = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,uid=,etime=,time=,command="],
+            capture_output=True, encoding="utf-8", errors="replace", check=True,
+        ).stdout
+    procs = {}
+    for line in text.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) < 6:
+            continue
+        pid, ppid, uid, etime, cputime, command = fields
+        procs[int(pid)] = {
+            "pid": int(pid), "ppid": int(ppid), "uid": int(uid),
+            "age": seconds(etime), "cpu_time": seconds(cputime), "command": command,
+        }
+    return procs
+
+
+def daemon_activity(workspace: Path) -> tuple[float | None, int | None]:
+    """Last handled client request time and last logged open-connection count, from the log tail."""
+    log = workspace / ".nx/workspace-data/d/daemon.log"
+    try:
+        with log.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - LOG_TAIL_BYTES))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None, None
+    handled = connections = None
+    for line in reversed(lines):
+        match = NX_LINE.match(line)
+        if not match:
+            continue
+        if connections is None:
+            count = NX_CONNECTIONS.search(match.group(2))
+            if count:
+                connections = int(count.group(1))
+        if handled is None and NX_HANDLED.match(match.group(2)):
+            try:
+                handled = dt.datetime.fromisoformat(match.group(1).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+        if handled is not None and connections is not None:
+            break
+    return handled, connections
+
+
+def classify(before, after, interval, args, now):
+    """Return (stop, report) lists of (process, reason)."""
+    stop, report = [], []
+    me = os.getuid() if args.uid is None else args.uid
+    for pid, proc in after.items():
+        if proc["uid"] != me or pid == os.getpid() or pid not in before:
+            continue
+        if before[pid]["command"] != proc["command"]:
+            continue
+        cpu = 100 * max(0.0, proc["cpu_time"] - before[pid]["cpu_time"]) / interval
+        proc["cpu"] = cpu
+        idle = cpu < args.idle_cpu
+        command, age, orphan = proc["command"], proc["age"], proc["ppid"] == 1
+
+        daemon = NX_DAEMON.search(command)
+        if daemon:
+            # A path with spaces cannot be recovered from ps text; never guess from a fragment.
+            workspace = Path(daemon.group(0).split("/node_modules/", 1)[0])
+            if not workspace.is_absolute():
+                continue
+            try:
+                workspace.stat()
+            except FileNotFoundError:
+                stop.append((proc, f"nx daemon for missing workspace {workspace}"))
+                continue
+            except OSError:
+                continue  # e.g. a privacy-protected folder launchd cannot read
+            handled, connections = daemon_activity(workspace)
+            if handled is None or connections is None or connections > 0:
+                continue
+            idle_for = now - handled
+            if idle_for > args.daemon_idle_minutes * 60 and age > args.daemon_idle_minutes * 60:
+                stop.append((proc, f"nx daemon idle {idle_for / 60:.0f}m in {workspace}"))
+            continue
+
+        if not orphan:
+            continue
+        if YARN_INSTALL.search(command):
+            report.append((proc, "reparented yarn install (never killed)"))
+            continue
+        if DEV_SERVER.search(command):
+            lifetime_cpu = 100 * proc["cpu_time"] / max(age, 1)
+            if age > 2 * 3600 and cpu > 70 and lifetime_cpu > 50:
+                stop.append((proc, f"wedged dev server at {cpu:.0f}% CPU"))
+            elif age > args.orphan_hours * 3600 and idle:
+                report.append((proc, "reparented dev server"))
+            continue
+        if CURSOR_AGENT.search(command):
+            if age > args.daemon_hours * 3600 and idle:
+                report.append((proc, f"cursor-agent idle for {age / 86400:.1f}d"))
+            continue
+        matched = False
+        for label, pattern in PLAYWRIGHT:
+            if pattern.search(command):
+                matched = True
+                if age > args.daemon_hours * 3600 and idle:
+                    stop.append((proc, f"{label} idle for {age / 86400:.1f}d"))
+                break
+        if matched:
+            continue
+        for label, pattern in REPARENTED:
+            if pattern(command) if callable(pattern) else pattern.search(command):
+                if age > args.orphan_hours * 3600 and idle:
+                    stop.append((proc, f"reparented {label}"))
+                break
+    return stop, report
+
+
+def log(message: str) -> None:
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    lines = LOG.read_text().splitlines()[-1999:] if LOG.exists() else []
+    lines.append(f"{dt.datetime.now().isoformat(timespec='seconds')} {message}")
+    LOG.write_text("\n".join(lines) + "\n")
+
+
+def terminate(proc, grace: float) -> str:
+    pid = proc["pid"]
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "gone"
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "terminated"
+        time.sleep(0.5)
+    current = snapshot(None).get(pid)
+    if current and current["command"] == proc["command"] and current["age"] >= proc["age"]:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return "terminated"
+        return "killed"
+    return "terminated"
+
+
+def notify(report) -> None:
+    key = hashlib.sha256(
+        json.dumps(sorted((p["pid"], p["command"]) for p, _ in report)).encode()
+    ).hexdigest()
+    try:
+        state = json.loads(STATE.read_text())
+        previous = state.get("key") if isinstance(state, dict) else None
+    except (OSError, ValueError):
+        previous = None
+    if key == previous:
+        return
+    # Reasons are fixed ASCII strings built above; never put command or path text in here.
+    summary = "; ".join(sorted({reason.split(" (")[0] for _, reason in report}))
+    text = f"{len(report)} leftover process(es): {summary}. See ~/Library/Logs/dev-reaper.log"
+    shown = subprocess.run(
+        ["osascript", "-e", f"display notification {json.dumps(text)} with title \"dev-reaper\""],
+        check=False, capture_output=True,
+    )
+    if shown.returncode == 0:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps({"key": key}))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true", help="print decisions, change nothing")
+    parser.add_argument("--json", action="store_true", help="print decisions as JSON")
+    parser.add_argument("--sample-seconds", type=float, default=5.0)
+    parser.add_argument("--idle-cpu", type=float, default=2.0, help="idle below this CPU percent")
+    parser.add_argument("--orphan-hours", type=float, default=6.0)
+    parser.add_argument("--daemon-hours", type=float, default=24.0)
+    parser.add_argument("--daemon-idle-minutes", type=float, default=60.0)
+    parser.add_argument("--grace-seconds", type=float, default=10.0)
+    parser.add_argument("--ps-before", help=argparse.SUPPRESS)
+    parser.add_argument("--ps-after", help=argparse.SUPPRESS)
+    parser.add_argument("--now", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--uid", type=int, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    started = time.monotonic()
+    before = snapshot(args.ps_before)
+    if not args.ps_after:
+        time.sleep(args.sample_seconds)
+    after = snapshot(args.ps_after)
+    interval = args.sample_seconds if args.ps_after else time.monotonic() - started
+    now = args.now if args.now is not None else time.time()
+    stop, report = classify(before, after, interval, args, now)
+
+    if args.json or args.dry_run:
+        decisions = [{"action": "stop", "pid": p["pid"], "reason": r} for p, r in stop]
+        decisions += [{"action": "report", "pid": p["pid"], "reason": r} for p, r in report]
+        if args.json:
+            print(json.dumps(decisions))
+        else:
+            for item in decisions:
+                print(f"{item['action']:6} {item['pid']:>7}  {item['reason']}")
+    if args.dry_run or args.ps_before or args.ps_after:
+        return 0
+
+    for proc, reason in stop:
+        current = snapshot(None).get(proc["pid"])
+        if not current or current["command"] != proc["command"] or current["age"] < proc["age"]:
+            log(f"skipped pid={proc['pid']} ({reason}): process changed before stop")
+            continue
+        try:
+            outcome = terminate(proc, args.grace_seconds)
+        except (OSError, subprocess.SubprocessError) as error:
+            outcome = f"failed ({error})"
+        log(f"{outcome} pid={proc['pid']} ({reason}) cmd={proc['command'][:160]}")
+    for proc, reason in report:
+        log(f"report pid={proc['pid']} ({reason}) cmd={proc['command'][:160]}")
+    if report:
+        notify(report)
+    log(f"run complete: stopped={len(stop)} reported={len(report)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
