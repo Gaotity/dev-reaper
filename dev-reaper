@@ -5,6 +5,8 @@ Runs from a LaunchAgent every 30 minutes. Idleness is measured from cumulative C
 short sampling window, never from the decaying %CPU column. Only the current user's processes
 are considered.
 
+Use --mcp-only to stop only idle reparented MCP servers and skip all other stop/report rules.
+
 Stopped automatically (SIGTERM, then SIGKILL after a grace period):
   - Nx daemons whose workspace is gone, or whose log shows no open client connection and no
     handled request for --daemon-idle-minutes. A connected client (Nx Console, `nx watch`) or a
@@ -164,6 +166,11 @@ def classify(before, after, interval, args, now):
         idle = cpu < args.idle_cpu
         command, age, orphan = proc["command"], proc["age"], proc["ppid"] == 1
 
+        if args.mcp_only:
+            if orphan and age > args.orphan_hours * 3600 and idle and is_mcp(command):
+                stop.append((proc, "reparented mcp server"))
+            continue
+
         daemon = NX_DAEMON.search(command)
         if daemon:
             # A path with spaces cannot be recovered from ps text; never guess from a fragment.
@@ -275,6 +282,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="print decisions, change nothing")
     parser.add_argument("--json", action="store_true", help="print decisions as JSON")
+    parser.add_argument("--mcp-only", action="store_true", help="stop only orphaned MCP servers; skip other rules")
     parser.add_argument("--sample-seconds", type=float, default=5.0)
     parser.add_argument("--idle-cpu", type=float, default=2.0, help="idle below this CPU percent")
     parser.add_argument("--orphan-hours", type=float, default=6.0)
