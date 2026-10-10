@@ -118,6 +118,14 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
         708: "stop",    # reparented Nx 22 plugin worker
     }
     assert actions == expected, json.dumps({"got": actions, "want": expected}, indent=1)
+    mcp_out = subprocess.run(
+        [sys.executable, "-I", str(SCRIPT), "--mcp-only", "--dry-run", "--json", "--sample-seconds", "5",
+         "--ps-before", str(before), "--ps-after", str(after), "--now", str(NOW), "--uid", str(UID)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    mcp_actions = {item["pid"]: item["action"] for item in json.loads(mcp_out)}
+    assert mcp_actions == {201: "stop", 704: "stop", 705: "stop"}, mcp_actions
+
     # Untouched on purpose: 102 busy daemon, 104 young daemon, 105 daemon without a log,
     # 106 daemon with an attached listener, 107 pnpm-layout daemon resolved to its workspace,
     # 108 workspace path with a space (unrecoverable from ps), 203 MCP with a live parent,
@@ -126,4 +134,4 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
     # 702/703 app helpers whose flags merely mention MCP, 706 user script under an mcp-named folder,
     # 707 HTTP MCP server (PPID 1 by design), 404 healthy dev server in a rebuild burst, 801 pid reused between samples.
 
-print("PASS: nx daemon idle/missing rules, reparented helpers, Playwright daemons, dev servers, reports only, uid and pid-reuse guards")
+print("PASS: default rules, MCP-only CLI, uid and pid-reuse guards")

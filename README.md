@@ -32,11 +32,17 @@ idle `cursor-agent` processes older than 24 hours, and reparented `yarn install`
 
 ```sh
 dev-reaper --dry-run    # print what it would stop or report; changes nothing
+dev-reaper --mcp-only --dry-run  # preview only idle reparented MCP servers
 dev-reaper              # act, and log to ~/Library/Logs/dev-reaper.log
 ```
 
 `--json` changes only the output format. Without `--dry-run` it still acts, so
 combine the two flags to preview decisions as JSON.
+
+`--mcp-only` selects only idle reparented MCP servers older than `--orphan-hours`
+(6 hours by default). It skips the Nx, LSP, browser, dev-server, and report rules.
+The CLI retains all existing rules when the flag is absent. For MCP-only scheduled
+cleanup, add `<string>--mcp-only</string>` after the script path in the LaunchAgent.
 
 Thresholds are flags; see `dev-reaper --help`.
 
