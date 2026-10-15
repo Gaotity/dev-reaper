@@ -49,6 +49,12 @@ cleanup, add `<string>--mcp-only</string>` after the script path in the LaunchAg
 running. It works with and without `--mcp-only`. Without this flag, the CLI only
 reports these processes.
 
+`--claude-sessions` reports, and never stops, background Claude Code sessions that
+an earlier Claude daemon started. After a Claude Code update, the new daemon does
+not retire these sessions, because their `bg-pty-host` has PPID 1. A session is
+reported when it is `done`, idle for more than 60 minutes, and its name does not
+start with ⭐. The flag uses `claude agents --json` and `~/.claude/jobs`.
+
 The log removes the values of flags such as `--api-key` and `--token`, because
 `cursor-agent` puts its API key in its arguments.
 

@@ -153,6 +153,47 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
     assert decide("--mcp-only", "--cursor-agents", after_file=with_app) == {201: "stop", 704: "stop", 705: "stop"}
     assert decide("--cursor-agents", after_file=with_app) == expected
 
+    # --claude-sessions: report only. A done session whose bg-pty-host has PPID 1 (an earlier daemon),
+    # idle over 60 min and without a star. Hosts under a live daemon are not candidates.
+    jobs = tmp / "jobs"
+    def job(job_id, minutes_idle):
+        transcript = tmp / f"{job_id}.jsonl"
+        transcript.write_text("")
+        import os
+        os.utime(transcript, (NOW - minutes_idle * 60,) * 2)
+        (jobs / job_id).mkdir(parents=True)
+        (jobs / job_id / "state.json").write_text(json.dumps(
+            {"updatedAt": iso(NOW - minutes_idle * 60), "linkScanPath": str(transcript)}))
+    host = "claude bg-pty-host --bg-pty-host /tmp/cc-daemon-501/x/spare/{0}.pty.sock 200 50 -- /v/2.1.299 --bg-spare /tmp/{0}.claim.sock"
+    sessions = {  # host pid: (host ppid, child pid, id, name, state, minutes idle)
+        910: (1, 911, "aaaa0001", "APACFE-1 stale", "done", 180),
+        920: (1, 921, "aaaa0002", "\u2b50 APACFE-2 starred", "done", 180),
+        930: (1, 931, "aaaa0003", "APACFE-3 blocked", "blocked", 180),
+        940: (1, 941, "aaaa0004", "APACFE-4 recent", "done", 30),
+        950: (29924, 951, "aaaa0005", "APACFE-5 live daemon", "done", 180),
+    }
+    rows_text = after.read_text()
+    agents = []
+    for host_pid, (ppid, child, job_id, name, state, idle) in sessions.items():
+        rows_text += f"{host_pid} {ppid} {UID} 1-00:00:00 0:01.00 {host.format(job_id)}\n"
+        rows_text += f"{child} {host_pid} {UID} 1-00:00:00 0:01.00 claude bg-spare --bg-spare /tmp/{job_id}.claim.sock\n"
+        agents.append({"pid": child, "id": job_id, "name": name, "state": state, "kind": "background"})
+        job(job_id, idle)
+    with_sessions = tmp / "after-sessions.txt"
+    with_sessions.write_text(rows_text)
+    agents_file = tmp / "agents.json"
+    agents_file.write_text(json.dumps(agents))
+    out = subprocess.run(
+        [sys.executable, "-I", str(SCRIPT), "--mcp-only", "--claude-sessions", "--dry-run", "--json",
+         "--sample-seconds", "5", "--ps-before", str(before), "--ps-after", str(with_sessions),
+         "--now", str(NOW), "--uid", str(UID), "--jobs-dir", str(jobs), "--agents-json", str(agents_file)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    session_items = [item for item in json.loads(out) if item["pid"] >= 900]
+    assert [(i["action"], i["pid"]) for i in session_items] == [("report", 911)], session_items
+    assert session_items[0]["reason"].endswith("(id aaaa0001)"), session_items
+    assert 911 not in decide("--mcp-only", after_file=with_sessions)  # opt-in only
+
     # The log never records the value of a secret flag.
     from importlib.machinery import SourceFileLoader
     reaper = SourceFileLoader("dev_reaper", str(SCRIPT)).load_module()
@@ -167,4 +208,4 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
     # 702/703 app helpers whose flags merely mention MCP, 706 user script under an mcp-named folder,
     # 707 HTTP MCP server (PPID 1 by design), 404 healthy dev server in a rebuild burst, 801 pid reused between samples.
 
-print("PASS: default rules, MCP-only CLI, cursor-agent CLI, redaction, uid and pid-reuse guards")
+print("PASS: default rules, MCP-only CLI, cursor-agent CLI, Claude session report, redaction, uid and pid-reuse guards")
