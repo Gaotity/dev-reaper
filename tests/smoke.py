@@ -66,6 +66,9 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
         403: (77, UID, "08:00:00", "0:10.00", "0:10.00", "next-server (v16.3.6)"),
         501: (1, UID, "10-00:00:00", "1:00.00", "1:00.00", "/u/agent-cli/.local/bin/cursor-agent --use-system-ca idx.js"),
         502: (1, UID, "00:50:00", "0:01.00", "0:01.00", "/u/agent-cli/.local/bin/cursor-agent --use-system-ca idx.js"),
+        503: (1, UID, "4-00:00:00", "0:10.00", "0:10.00", "/u/agent-cli/.local/bin/cursor-agent --use-system-ca idx.js --api-key crsr_x"),
+        504: (1, UID, "4-00:00:00", "0:10.00", "0:12.00", "/u/agent-cli/.local/bin/cursor-agent --use-system-ca idx.js"),
+        505: (4242, UID, "9-00:00:00", "0:10.00", "0:10.00", "/u/agent-cli/.local/bin/cursor-agent --use-system-ca idx.js"),
         601: (1, UID, "00:20:00", "1:00.00", "1:08.00", "/usr/bin/node /u/fnm/bin/yarn install"),
         701: (1, 0, "9-00:00:00", "0:00.00", "0:00.00", "/usr/bin/node /x/npx/root-mcp/cli.js"),
         702: (1, UID, "9-00:00:00", "0:00.00", "0:00.00",
@@ -112,6 +115,7 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
         401: "stop",    # wedged reparented dev server (80% now, 83% over its lifetime)
         402: "report",  # idle reparented dev server
         501: "report",  # cursor-agent idle 10d
+        503: "report",  # cursor-agent idle 4d
         601: "report",  # reparented yarn install is never killed
         704: "stop",    # reparented npx MCP server binary
         705: "stop",    # reparented *mcp binary
@@ -126,6 +130,35 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
     mcp_actions = {item["pid"]: item["action"] for item in json.loads(mcp_out)}
     assert mcp_actions == {201: "stop", 704: "stop", 705: "stop"}, mcp_actions
 
+    def decide(*flags, after_file=after):
+        out = subprocess.run(
+            [sys.executable, "-I", str(SCRIPT), *flags, "--dry-run", "--json", "--sample-seconds", "5",
+             "--ps-before", str(before), "--ps-after", str(after_file), "--now", str(NOW), "--uid", str(UID)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        return {item["pid"]: item["action"] for item in json.loads(out)}
+
+    # --cursor-agents: stop idle reparented cursor-agent older than 72h while Cursor.app is not running.
+    # 502 is young, 504 is busy, 505 has a live parent.
+    cursor_mcp = decide("--mcp-only", "--cursor-agents")
+    assert cursor_mcp == {201: "stop", 704: "stop", 705: "stop", 501: "stop", 503: "stop"}, cursor_mcp
+    cursor_all = decide("--cursor-agents")
+    assert cursor_all == {**expected, 501: "stop", 503: "stop"}, cursor_all
+    shorter = decide("--mcp-only", "--cursor-agents", "--cursor-agent-hours", "120")
+    assert shorter == {201: "stop", 704: "stop", 705: "stop", 501: "stop"}, shorter
+
+    # A running Cursor.app keeps every cursor-agent; the default rules then only report them.
+    with_app = tmp / "after-cursor-app.txt"
+    with_app.write_text(after.read_text() + f"900 1 {UID} 1-00:00:00 0:01.00 /Applications/Cursor.app/Contents/MacOS/Cursor\n")
+    assert decide("--mcp-only", "--cursor-agents", after_file=with_app) == {201: "stop", 704: "stop", 705: "stop"}
+    assert decide("--cursor-agents", after_file=with_app) == expected
+
+    # The log never records the value of a secret flag.
+    from importlib.machinery import SourceFileLoader
+    reaper = SourceFileLoader("dev_reaper", str(SCRIPT)).load_module()
+    assert reaper.redact("/x/cursor-agent idx.js --api-key crsr_secret --x") == "/x/cursor-agent idx.js --api-key <redacted> --x"
+    assert reaper.redact("/x/tool --token=abc --github-token xyz") == "/x/tool --token=<redacted> --github-token <redacted>"
+
     # Untouched on purpose: 102 busy daemon, 104 young daemon, 105 daemon without a log,
     # 106 daemon with an attached listener, 107 pnpm-layout daemon resolved to its workspace,
     # 108 workspace path with a space (unrecoverable from ps), 203 MCP with a live parent,
@@ -134,4 +167,4 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
     # 702/703 app helpers whose flags merely mention MCP, 706 user script under an mcp-named folder,
     # 707 HTTP MCP server (PPID 1 by design), 404 healthy dev server in a rebuild burst, 801 pid reused between samples.
 
-print("PASS: default rules, MCP-only CLI, uid and pid-reuse guards")
+print("PASS: default rules, MCP-only CLI, cursor-agent CLI, redaction, uid and pid-reuse guards")
