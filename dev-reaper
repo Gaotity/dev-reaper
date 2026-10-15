@@ -6,6 +6,8 @@ short sampling window, never from the decaying %CPU column. Only the current use
 are considered.
 
 Use --mcp-only to stop only idle reparented MCP servers and skip all other stop/report rules.
+Use --cursor-agents to also stop idle reparented cursor-agent processes older than
+--cursor-agent-hours while Cursor.app is not running. It works with and without --mcp-only.
 
 Stopped automatically (SIGTERM, then SIGKILL after a grace period):
   - Nx daemons whose workspace is gone, or whose log shows no open client connection and no
@@ -90,6 +92,13 @@ PLAYWRIGHT = [
 ]
 DEV_SERVER = re.compile(r"next-server|\bnext dev\b|/vite(\.js)? |\bnx(\.js)? run \S+:(dev|serve)\b")
 CURSOR_AGENT = re.compile(r"/cursor-agent ")
+CURSOR_APP = re.compile(r"/Cursor\.app/Contents/MacOS/Cursor(\s|$)")
+SECRET_FLAG = re.compile(r"(--[\w-]*(?:api-key|token|secret|password)[\w-]*[= ])\S+", re.I)
+
+
+def redact(command: str) -> str:
+    """Remove the values of secret flags (cursor-agent puts its API key in argv)."""
+    return SECRET_FLAG.sub(r"\1<redacted>", command)
 YARN_INSTALL = re.compile(r"/yarn install\b|\byarn(\.js)? install\b")
 
 
@@ -156,6 +165,7 @@ def classify(before, after, interval, args, now):
     """Return (stop, report) lists of (process, reason)."""
     stop, report = [], []
     me = os.getuid() if args.uid is None else args.uid
+    cursor_app = any(CURSOR_APP.search(p["command"]) for p in after.values() if p["uid"] == me)
     for pid, proc in after.items():
         if proc["uid"] != me or pid == os.getpid() or pid not in before:
             continue
@@ -165,6 +175,11 @@ def classify(before, after, interval, args, now):
         proc["cpu"] = cpu
         idle = cpu < args.idle_cpu
         command, age, orphan = proc["command"], proc["age"], proc["ppid"] == 1
+
+        if args.cursor_agents and orphan and CURSOR_AGENT.search(command):
+            if not cursor_app and idle and age > args.cursor_agent_hours * 3600:
+                stop.append((proc, f"cursor-agent without Cursor.app, idle for {age / 86400:.1f}d"))
+                continue
 
         if args.mcp_only:
             if orphan and age > args.orphan_hours * 3600 and idle and is_mcp(command):
@@ -283,6 +298,9 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="print decisions, change nothing")
     parser.add_argument("--json", action="store_true", help="print decisions as JSON")
     parser.add_argument("--mcp-only", action="store_true", help="stop only orphaned MCP servers; skip other rules")
+    parser.add_argument("--cursor-agents", action="store_true",
+                        help="also stop idle reparented cursor-agent processes while Cursor.app is not running")
+    parser.add_argument("--cursor-agent-hours", type=float, default=72.0)
     parser.add_argument("--sample-seconds", type=float, default=5.0)
     parser.add_argument("--idle-cpu", type=float, default=2.0, help="idle below this CPU percent")
     parser.add_argument("--orphan-hours", type=float, default=6.0)
@@ -324,9 +342,9 @@ def main() -> int:
             outcome = terminate(proc, args.grace_seconds)
         except (OSError, subprocess.SubprocessError) as error:
             outcome = f"failed ({error})"
-        log(f"{outcome} pid={proc['pid']} ({reason}) cmd={proc['command'][:160]}")
+        log(f"{outcome} pid={proc['pid']} ({reason}) cmd={redact(proc['command'])[:160]}")
     for proc, reason in report:
-        log(f"report pid={proc['pid']} ({reason}) cmd={proc['command'][:160]}")
+        log(f"report pid={proc['pid']} ({reason}) cmd={redact(proc['command'])[:160]}")
     if report:
         notify(report)
     log(f"run complete: stopped={len(stop)} reported={len(report)}")

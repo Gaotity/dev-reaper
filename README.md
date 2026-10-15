@@ -44,6 +44,14 @@ combine the two flags to preview decisions as JSON.
 The CLI retains all existing rules when the flag is absent. For MCP-only scheduled
 cleanup, add `<string>--mcp-only</string>` after the script path in the LaunchAgent.
 
+`--cursor-agents` also stops idle reparented `cursor-agent` processes older than
+`--cursor-agent-hours` (72 hours by default), but only when `Cursor.app` is not
+running. It works with and without `--mcp-only`. Without this flag, the CLI only
+reports these processes.
+
+The log removes the values of flags such as `--api-key` and `--token`, because
+`cursor-agent` puts its API key in its arguments.
+
 Thresholds are flags; see `dev-reaper --help`.
 
 ## Install
