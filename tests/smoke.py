@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """Verify dev-reaper's stop/report decisions from injected ps snapshots; nothing is signalled."""
 
+import datetime as dt
+import importlib.machinery
+import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True  # the import of the script below must not leave a __pycache__ in the repository
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "dev-reaper"
 NOW = 1_800_000_000.0
 UID = 501
-DAY, HOUR = "1-00:00:00", "01:00:00"
 
 
 def iso(epoch):
-    import datetime as dt
     return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
@@ -159,7 +163,6 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
     def job(job_id, minutes_idle):
         transcript = tmp / f"{job_id}.jsonl"
         transcript.write_text("")
-        import os
         os.utime(transcript, (NOW - minutes_idle * 60,) * 2)
         (jobs / job_id).mkdir(parents=True)
         (jobs / job_id / "state.json").write_text(json.dumps(
@@ -195,8 +198,10 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
     assert 911 not in decide("--mcp-only", after_file=with_sessions)  # opt-in only
 
     # The log never records the value of a secret flag.
-    from importlib.machinery import SourceFileLoader
-    reaper = SourceFileLoader("dev_reaper", str(SCRIPT)).load_module()
+    # The script has no .py suffix, so the loader must be explicit.
+    loader = importlib.machinery.SourceFileLoader("dev_reaper", str(SCRIPT))
+    reaper = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(reaper)
     assert reaper.redact("/x/cursor-agent idx.js --api-key crsr_secret --x") == "/x/cursor-agent idx.js --api-key <redacted> --x"
     assert reaper.redact("/x/tool --token=abc --github-token xyz") == "/x/tool --token=<redacted> --github-token <redacted>"
 
