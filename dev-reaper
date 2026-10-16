@@ -52,8 +52,6 @@ NX_CONNECTIONS = re.compile(r"Number of open connections: (\d+)")
 LOG_TAIL_BYTES = 1 << 20
 INTERPRETERS = {"node", "python", "python3", "uv", "uvx", "npx", "npm", "bun", "deno"}
 MCP_SEGMENT = re.compile(r"(^|[-@_.])mcp([-@_.]|$)", re.I)
-
-
 PACKAGE_DIRS = ("/_npx/", "/node_modules/.bin/", "/uv/tools/", "/.local/bin/")
 
 
@@ -96,73 +94,9 @@ PLAYWRIGHT = [
 DEV_SERVER = re.compile(r"next-server|\bnext dev\b|/vite(\.js)? |\bnx(\.js)? run \S+:(dev|serve)\b")
 CURSOR_AGENT = re.compile(r"/cursor-agent ")
 CURSOR_APP = re.compile(r"/Cursor\.app/Contents/MacOS/Cursor(\s|$)")
-SECRET_FLAG = re.compile(r"(--[\w-]*(?:api-key|token|secret|password)[\w-]*[= ])\S+", re.I)
-
-
-BG_PTY_HOST = re.compile(r"(^|/)claude bg-pty-host ")
-
-
-def claude_agents(fixture: str | None) -> list[dict]:
-    """Background sessions from `claude agents --json`; an empty list when the CLI is not available."""
-    if fixture:
-        return json.loads(Path(fixture).read_text())
-    for claude in (shutil.which("claude"), str(HOME / ".local/bin/claude")):
-        if not claude or not Path(claude).is_file():
-            continue
-        try:
-            result = subprocess.run([claude, "agents", "--json"], capture_output=True, text=True, timeout=30)
-            return json.loads(result.stdout) if result.returncode == 0 else []
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return []
-    return []
-
-
-def session_idle_seconds(jobs: Path, job_id: str, now: float) -> float | None:
-    """Seconds since the newest of the job's updatedAt and its transcript mtime; None if unknown."""
-    try:
-        state = json.loads((jobs / job_id / "state.json").read_text())
-    except (OSError, ValueError):
-        return None
-    latest = []
-    try:
-        latest.append(dt.datetime.fromisoformat(str(state["updatedAt"]).replace("Z", "+00:00")).timestamp())
-    except (KeyError, ValueError):
-        pass
-    transcript = state.get("linkScanPath")
-    if transcript:
-        try:
-            latest.append(Path(transcript).stat().st_mtime)
-        except OSError:
-            pass
-    return now - max(latest) if latest else None
-
-
-def stale_claude_sessions(after, args, now):
-    """Report-only: done sessions under a reparented bg-pty-host, idle over 60 min, without a star."""
-    me = os.getuid() if args.uid is None else args.uid
-    hosts = {pid for pid, proc in after.items()
-             if proc["uid"] == me and proc["ppid"] == 1 and BG_PTY_HOST.search(proc["command"])}
-    if not hosts:
-        return []
-    children = {pid: proc for pid, proc in after.items() if proc["ppid"] in hosts}
-    jobs = Path(args.jobs_dir)
-    report = []
-    for agent in claude_agents(args.agents_json):
-        proc = children.get(agent.get("pid"))
-        if not proc or agent.get("state") != "done" or str(agent.get("name", "")).startswith("\u2b50"):
-            continue
-        idle = session_idle_seconds(jobs, str(agent.get("id", "")), now)
-        if idle is None or idle < 3600:
-            continue
-        # The id is in parentheses, so the notification text (reason before " (") never shows it.
-        report.append((proc, f"claude session from an earlier daemon, done, idle {idle / 3600:.1f}h (id {agent.get('id')})"))
-    return report
-
-
-def redact(command: str) -> str:
-    """Remove the values of secret flags (cursor-agent puts its API key in argv)."""
-    return SECRET_FLAG.sub(r"\1<redacted>", command)
 YARN_INSTALL = re.compile(r"/yarn install\b|\byarn(\.js)? install\b")
+BG_PTY_HOST = re.compile(r"(^|/)claude bg-pty-host ")
+SECRET_FLAG = re.compile(r"(--[\w-]*(?:api-key|token|secret|password)[\w-]*[= ])\S+", re.I)
 
 
 def seconds(text: str) -> float:
@@ -301,6 +235,68 @@ def classify(before, after, interval, args, now):
                     stop.append((proc, f"reparented {label}"))
                 break
     return stop, report
+
+
+def claude_agents(fixture: str | None) -> list[dict]:
+    """Background sessions from `claude agents --json`; an empty list when the CLI is not available."""
+    if fixture:
+        return json.loads(Path(fixture).read_text())
+    for claude in (shutil.which("claude"), str(HOME / ".local/bin/claude")):
+        if not claude or not Path(claude).is_file():
+            continue
+        try:
+            result = subprocess.run([claude, "agents", "--json"], capture_output=True, text=True, timeout=30)
+            return json.loads(result.stdout) if result.returncode == 0 else []
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return []
+    return []
+
+
+def session_idle_seconds(jobs: Path, job_id: str, now: float) -> float | None:
+    """Seconds since the newest of the job's updatedAt and its transcript mtime; None if unknown."""
+    try:
+        state = json.loads((jobs / job_id / "state.json").read_text())
+    except (OSError, ValueError):
+        return None
+    latest = []
+    try:
+        latest.append(dt.datetime.fromisoformat(str(state["updatedAt"]).replace("Z", "+00:00")).timestamp())
+    except (KeyError, ValueError):
+        pass
+    transcript = state.get("linkScanPath")
+    if transcript:
+        try:
+            latest.append(Path(transcript).stat().st_mtime)
+        except OSError:
+            pass
+    return now - max(latest) if latest else None
+
+
+def stale_claude_sessions(after, args, now):
+    """Report-only: done sessions under a reparented bg-pty-host, idle over 60 min, without a star."""
+    me = os.getuid() if args.uid is None else args.uid
+    hosts = {pid for pid, proc in after.items()
+             if proc["uid"] == me and proc["ppid"] == 1 and BG_PTY_HOST.search(proc["command"])}
+    if not hosts:
+        return []
+    children = {pid: proc for pid, proc in after.items() if proc["ppid"] in hosts}
+    jobs = Path(args.jobs_dir)
+    report = []
+    for agent in claude_agents(args.agents_json):
+        proc = children.get(agent.get("pid"))
+        if not proc or agent.get("state") != "done" or str(agent.get("name", "")).startswith("\u2b50"):
+            continue
+        idle = session_idle_seconds(jobs, str(agent.get("id", "")), now)
+        if idle is None or idle < 3600:
+            continue
+        # The id is in parentheses, so the notification text (reason before " (") never shows it.
+        report.append((proc, f"claude session from an earlier daemon, done, idle {idle / 3600:.1f}h (id {agent.get('id')})"))
+    return report
+
+
+def redact(command: str) -> str:
+    """Remove the values of secret flags (cursor-agent puts its API key in argv)."""
+    return SECRET_FLAG.sub(r"\1<redacted>", command)
 
 
 def log(message: str) -> None:
