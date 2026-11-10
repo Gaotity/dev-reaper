@@ -194,9 +194,61 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
     assert session_items[0]["reason"].endswith("(id aaaa0001)"), session_items
     assert 911 not in decide("--mcp-only", after_file=with_sessions)  # opt-in only
 
-    # The log never records the value of a secret flag.
     from importlib.machinery import SourceFileLoader
-    reaper = SourceFileLoader("dev_reaper", str(SCRIPT)).load_module()
+    import importlib.util
+    sys.dont_write_bytecode = True
+    loader = SourceFileLoader("dev_reaper", str(SCRIPT))
+    reaper = importlib.util.module_from_spec(importlib.util.spec_from_loader("dev_reaper", loader))
+    loader.exec_module(reaper)
+
+    # --build-caches: clean the caches of each idle workspace below ROOT that no process uses.
+    import os
+    caches_root = tmp / "workspaces"
+    def workspace(name, hours_idle, caches=(".next",)):
+        ws = caches_root / name
+        (ws / ".jj/working_copy").mkdir(parents=True)
+        (ws / ".jj/working_copy/checkout").write_text("")
+        for cache in caches:
+            (ws / cache / "cache").mkdir(parents=True)
+            (ws / cache / "cache/blob").write_text("x")
+        for path in sorted(ws.rglob("*"), reverse=True):
+            os.utime(path, (NOW - hours_idle * 3600,) * 2)
+        return ws
+    idle_cache = workspace("idle", 48, ("platform/web/.next", "node_modules/.vite", ".nx"))
+    workspace("recent", 2)
+    workspace("open-in-shell", 48)
+    workspace("in-command", 48)
+    workspace("no-caches", 48, ())
+    workspace("deps-only", 48, ("node_modules/pkg/.next", ".hidden/.next"))
+    cwds = tmp / "cwds.txt"
+    cwds.write_text(f"/\n{caches_root}/open-in-shell/platform/web\n")
+    with_dev_server = tmp / "after-dev-server.txt"
+    with_dev_server.write_text(after.read_text()
+                               + f"960 1 {UID} 1-00:00:00 0:01.00 /usr/bin/node {caches_root}/in-command/node_modules/.bin/next dev\n")
+
+    def cleaned(*flags):
+        out = subprocess.run(
+            [sys.executable, "-I", str(SCRIPT), *flags, "--cwds", str(cwds), "--dry-run", "--json",
+             "--sample-seconds", "5", "--ps-before", str(before), "--ps-after", str(with_dev_server),
+             "--now", str(NOW), "--uid", str(UID)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        items = json.loads(out)
+        assert all("pid" not in item for item in items if item["action"] == "clean"), items
+        return {item["path"]: item["reason"] for item in items if item["action"] == "clean"}
+
+    root_flag = ("--build-caches", str(caches_root))
+    assert cleaned("--mcp-only", *root_flag) == {str(idle_cache): "build caches idle 48h"}
+    assert set(cleaned(*root_flag)) == {str(idle_cache)}
+    assert set(cleaned("--mcp-only", *root_flag, "--build-cache-hours", "1")) == {
+        str(idle_cache), str(caches_root / "recent")}
+    assert cleaned("--mcp-only") == {}  # opt-in only
+    assert cleaned("--mcp-only", "--build-caches", str(tmp / "missing")) == {}
+    assert sorted(reaper.build_caches(idle_cache)) == sorted(
+        idle_cache / c for c in (".nx", "node_modules/.vite", "platform/web/.next"))
+    assert reaper.build_caches(caches_root / "deps-only") == []
+
+    # The log never records the value of a secret flag.
     assert reaper.redact("/x/cursor-agent idx.js --api-key crsr_secret --x") == "/x/cursor-agent idx.js --api-key <redacted> --x"
     assert reaper.redact("/x/tool --token=abc --github-token xyz") == "/x/tool --token=<redacted> --github-token <redacted>"
 
@@ -208,4 +260,4 @@ with tempfile.TemporaryDirectory(prefix="dev-reaper-smoke-") as tmp:
     # 702/703 app helpers whose flags merely mention MCP, 706 user script under an mcp-named folder,
     # 707 HTTP MCP server (PPID 1 by design), 404 healthy dev server in a rebuild burst, 801 pid reused between samples.
 
-print("PASS: default rules, MCP-only CLI, cursor-agent CLI, Claude session report, redaction, uid and pid-reuse guards")
+print("PASS: default rules, MCP-only CLI, cursor-agent CLI, Claude session report, build-cache cleanup, redaction, uid and pid-reuse guards")

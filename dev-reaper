@@ -10,6 +10,9 @@ Use --claude-sessions to report (never stop) background Claude Code sessions tha
 Claude daemon started: their bg-pty-host has PPID 1, so the current daemon does not retire them.
 Use --cursor-agents to also stop idle reparented cursor-agent processes older than
 --cursor-agent-hours while Cursor.app is not running. It works with and without --mcp-only.
+Use --build-caches ROOT (more than once if necessary) to remove the build caches (.next, .nx,
+node_modules/.vite) of each workspace directly below ROOT that no process uses and that had no
+activity for --build-cache-hours. It works with and without --mcp-only.
 
 Stopped automatically (SIGTERM, then SIGKILL after a grace period):
   - Nx daemons whose workspace is gone, or whose log shows no open client connection and no
@@ -157,6 +160,117 @@ def stale_claude_sessions(after, args, now):
         # The id is in parentheses, so the notification text (reason before " (") never shows it.
         report.append((proc, f"claude session from an earlier daemon, done, idle {idle / 3600:.1f}h (id {agent.get('id')})"))
     return report
+
+
+BUILD_CACHE_NAMES = {".next", ".nx"}
+BUILD_CACHE_DEPTH = 5
+
+
+def build_caches(workspace: Path) -> list[Path]:
+    """Cache directories in a workspace. Hidden directories and dependency trees are not searched."""
+    found = []
+
+    def walk(directory: Path, level: int) -> None:
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            path = Path(entry.path)
+            if entry.name in BUILD_CACHE_NAMES:
+                found.append(path)
+            elif entry.name == "node_modules":
+                if (path / ".vite").is_dir():
+                    found.append(path / ".vite")
+            elif not entry.name.startswith(".") and level < BUILD_CACHE_DEPTH:
+                walk(path, level + 1)
+
+    walk(workspace, 0)
+    return found
+
+
+def last_activity(workspace: Path, caches: list[Path]) -> float:
+    """Newest mtime of the jj working copy state, the Git index and HEAD log, and each cache and its entries."""
+    paths = []
+    working_copy = workspace / ".jj/working_copy"
+    if working_copy.is_dir():
+        paths += list(working_copy.iterdir())
+    git = workspace / ".git"
+    git_dir = git
+    if git.is_file():
+        text = git.read_text(errors="replace").strip()
+        if text.startswith("gitdir:"):
+            git_dir = (workspace / text.removeprefix("gitdir:").strip()).resolve()
+    paths += [git_dir / "index", git_dir / "logs/HEAD"]
+    for cache in caches:
+        paths.append(cache)
+        try:
+            paths += list(cache.iterdir())
+        except OSError:
+            pass
+    newest = 0.0
+    for path in paths:
+        try:
+            newest = max(newest, path.lstat().st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
+def tree_bytes(path: Path) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def process_cwds(fixture: str | None, uid: int) -> list[str] | None:
+    """Working directories of the user's processes; None when they cannot be read."""
+    if fixture:
+        return Path(fixture).read_text().splitlines()
+    try:
+        result = subprocess.run(["lsof", "-a", "-u", str(uid), "-d", "cwd", "-Fn"],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode not in (0, 1) or not result.stdout:
+        return None
+    return [line[1:] for line in result.stdout.splitlines() if line.startswith("n")]
+
+
+def build_cache_cleanups(after, args, now):
+    """Return (workspace, caches, reason) for each idle workspace below the --build-caches roots."""
+    me = os.getuid() if args.uid is None else args.uid
+    cwds = process_cwds(args.cwds, me)
+    if cwds is None:
+        return []  # Without the working directories, a workspace in use cannot be found.
+    commands = [proc["command"] for proc in after.values() if proc["uid"] == me]
+    cleanups = []
+    for root in args.build_caches:
+        try:
+            workspaces = sorted(Path(entry.path) for entry in os.scandir(Path(root).expanduser())
+                                if entry.is_dir(follow_symlinks=False))
+        except OSError:
+            continue
+        for workspace in workspaces:
+            prefix = f"{workspace}/"
+            if any(cwd == str(workspace) or cwd.startswith(prefix) for cwd in cwds):
+                continue
+            if any(prefix in command or command.endswith(str(workspace)) for command in commands):
+                continue
+            caches = build_caches(workspace)
+            if not caches:
+                continue
+            idle_for = now - last_activity(workspace, caches)
+            if idle_for > args.build_cache_hours * 3600:
+                cleanups.append((workspace, caches, f"build caches idle {idle_for / 3600:.0f}h"))
+    return cleanups
 
 
 def redact(command: str) -> str:
@@ -368,6 +482,10 @@ def main() -> int:
     parser.add_argument("--cursor-agents", action="store_true",
                         help="also stop idle reparented cursor-agent processes while Cursor.app is not running")
     parser.add_argument("--cursor-agent-hours", type=float, default=72.0)
+    parser.add_argument("--build-caches", action="append", default=[], metavar="ROOT",
+                        help="remove .next, .nx, and node_modules/.vite in idle workspaces below ROOT")
+    parser.add_argument("--build-cache-hours", type=float, default=24.0)
+    parser.add_argument("--cwds", help=argparse.SUPPRESS)
     parser.add_argument("--sample-seconds", type=float, default=5.0)
     parser.add_argument("--idle-cpu", type=float, default=2.0, help="idle below this CPU percent")
     parser.add_argument("--orphan-hours", type=float, default=6.0)
@@ -390,15 +508,17 @@ def main() -> int:
     stop, report = classify(before, after, interval, args, now)
     if args.claude_sessions:
         report += stale_claude_sessions(after, args, now)
+    cleanups = build_cache_cleanups(after, args, now) if args.build_caches else []
 
     if args.json or args.dry_run:
         decisions = [{"action": "stop", "pid": p["pid"], "reason": r} for p, r in stop]
         decisions += [{"action": "report", "pid": p["pid"], "reason": r} for p, r in report]
+        decisions += [{"action": "clean", "path": str(w), "reason": r} for w, _, r in cleanups]
         if args.json:
             print(json.dumps(decisions))
         else:
             for item in decisions:
-                print(f"{item['action']:6} {item['pid']:>7}  {item['reason']}")
+                print(f"{item['action']:6} {item.get('pid', item.get('path')):>7}  {item['reason']}")
     if args.dry_run or args.ps_before or args.ps_after:
         return 0
 
@@ -414,9 +534,16 @@ def main() -> int:
         log(f"{outcome} pid={proc['pid']} ({reason}) cmd={redact(proc['command'])[:160]}")
     for proc, reason in report:
         log(f"report pid={proc['pid']} ({reason}) cmd={redact(proc['command'])[:160]}")
+    freed = 0
+    for workspace, caches, reason in cleanups:
+        size = sum(tree_bytes(cache) for cache in caches)
+        for cache in caches:
+            shutil.rmtree(cache, ignore_errors=True)
+        freed += size
+        log(f"cleaned {workspace} ({reason}, {size / 2**30:.1f} GB)")
     if report:
         notify(report)
-    log(f"run complete: stopped={len(stop)} reported={len(report)}")
+    log(f"run complete: stopped={len(stop)} reported={len(report)} cleaned={len(cleanups)} freed={freed / 2**30:.1f}GB")
     return 0
 
 
