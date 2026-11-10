@@ -55,6 +55,17 @@ not retire these sessions, because their `bg-pty-host` has PPID 1. A session is
 reported when it is `done`, idle for more than 60 minutes, and its name does not
 start with ⭐. The flag uses `claude agents --json` and `~/.claude/jobs`.
 
+`--build-caches ROOT` removes build caches in the workspaces directly below `ROOT`.
+Use the flag more than once for more roots. The caches are `.next`, `.nx`, and
+`node_modules/.vite`, found up to five directories deep. The search does not go into
+hidden directories or dependency trees. A workspace is skipped when a process has its
+working directory in it, or when a process command contains its path. Its caches are
+removed when the newest of these times is older than `--build-cache-hours` (24 hours
+by default): the jj working copy state, the Git index and HEAD log, and each cache
+directory and its entries. If `lsof` cannot list the working directories, the rule
+removes nothing. The source code, the checkout, and `node_modules` stay. The flag
+works with and without `--mcp-only`.
+
 The log removes the values of flags such as `--api-key` and `--token`, because
 `cursor-agent` puts its API key in its arguments.
 
