@@ -11,7 +11,8 @@ permissions:
 jobs:
   smoke:
     # The smoke test uses recorded ps snapshots and sends no signals, so a Linux runner is enough.
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 has no Python 3.9 build for setup-python. Python 3.9 is the macOS system python3.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
